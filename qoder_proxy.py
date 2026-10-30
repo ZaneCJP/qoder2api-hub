@@ -4818,6 +4818,12 @@ def _recover_leaked_tool_calls_inner(frames, allowed_names=None):
                 # issue #16 兜底：超限即 fail-open 放行（内存 + 首字延迟）。
                 if len(hold) > _HOLD_MAX_CHARS \
                         or hold_frames > _HOLD_MAX_FRAMES:
+                    # issue #112：超限放行前先补一次 #72 判定 —— marker-only 的
+                    # 空壳块走到这里会被当正文发出去，绕过流末的 fail-closed
+                    # （实测日志：released oversized leak hold (21 chars /
+                    # 201 frames) — fail-open）。
+                    if allowed_names and _marker_only_echo(hold):
+                        raise EmptyToolEcho(len(hold), "marker_only_released")
                     log("released oversized leak hold (%d chars / %d frames) "
                         "— fail-open" % (len(hold), hold_frames),
                         level="WARN", tag="chat")
@@ -5105,15 +5111,70 @@ def _sse_recover_dsml(frames, allowed_names=None):
         yield _leak_chunk_frame(meta, {}, "tool_calls")
 
 
+def _sse_guard_truncated_tool_args(frames):
+    """issue #112：上游在 tool_calls 的 arguments 还没写完时就干净 EOF。
+
+    症状（客户端侧）：流里出现了一半的 `tool_calls` 增量，随后既没有
+    `finish_reason` 也没有错误帧，连接正常关闭 —— coding agent 只看到
+    「参数不完整的调用 + 流结束」，整轮任务静默中断，用户看到的就是
+    「助手突然只回了几个命令片段就停了」。
+
+    这里在流末做一次完整性校验：累计到过 tool_call 增量、没收到
+    finish_reason、且某个调用的 arguments 不是合法 JSON -> 抛
+    EmptyToolEcho（fail-closed）。四条协议出口会把它转成明确失败，
+    客户端据此重试，而不是把半截调用当成功收尾。其余情况逐字节透传。
+    """
+    calls = {}
+    finish_seen = False
+    for raw in frames:
+        try:
+            text = (raw.decode("utf-8", "replace")
+                    if isinstance(raw, bytes) else raw)
+            data = strip_data_prefix(text)
+            if data and data != "[DONE]":
+                payload = json.loads(data)
+                choice = (payload.get("choices") or [{}])[0] or {}
+                if choice.get("finish_reason"):
+                    finish_seen = True
+                for tc in ((choice.get("delta") or {}).get("tool_calls") or []):
+                    idx = tc.get("index")
+                    idx = 0 if idx is None else idx
+                    slot = calls.setdefault(idx, {"args": "", "name": ""})
+                    fn = tc.get("function") or {}
+                    if fn.get("name"):
+                        slot["name"] = fn["name"]
+                    if fn.get("arguments"):
+                        slot["args"] += fn["arguments"]
+        except Exception:
+            pass
+        yield raw
+    if not calls or finish_seen:
+        return
+    for _idx, slot in sorted(calls.items()):
+        args = (slot.get("args") or "").strip()
+        if not args:
+            continue
+        try:
+            json.loads(args)
+        except Exception:
+            log("stream ended without finish_reason and tool call '%s' has "
+                "incomplete JSON arguments (%d chars) — failing closed "
+                "(issue #112)" % (slot.get("name") or "?", len(args)),
+                level="WARN", tag="chat")
+            raise EmptyToolEcho(len(args), "truncated_arguments")
+
+
 def recover_leaked_tool_calls(frames, allowed_names=None):
-    """流式出口：回读（issue #8）+ **tool_call id 保证**（issue #47）。
+    """流式出口：回读（issue #8）+ **tool_call id 保证**（issue #47）
+    + 截断参数守卫（issue #112）。
 
     保持同名：三条调用点（chat 主链路 / Anthropic / Responses）都不用改。
     """
-    for frame in _sse_fill_tool_call_ids(
-            _sse_recover_dsml(
-                _recover_leaked_tool_calls_inner(frames, allowed_names),
-                allowed_names)):
+    for frame in _sse_guard_truncated_tool_args(
+            _sse_fill_tool_call_ids(
+                _sse_recover_dsml(
+                    _recover_leaked_tool_calls_inner(frames, allowed_names),
+                    allowed_names))):
         yield frame
 
 
