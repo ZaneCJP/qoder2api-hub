@@ -96,4 +96,35 @@ check("#120 恢复后的帧里带 tool_calls",
       any("tool_calls" in f.decode("utf-8", "replace") for f in _out3),
       len(_out3))
 
+# --------- 路径 3（2026-10-30 17:58 实测复发）：只带 DSML 令牌、没有 LEAK_MARKER
+# 日志原文：unrecovered tool-protocol leak passed through (58 chars, markers=0, dsml=3)
+# at dsml-stream —— 旧判定要求「必须出现 LEAK_MARKER」，这条就漏过去了。
+_dsml_only = "<|DSML|calls>\n</|DSML|invoke>\n</|DSML|calls>\n"
+check("#120b 样例确实不含 LEAK_MARKER（复现 markers=0）",
+      P.LEAK_MARKER not in _dsml_only and P.LEAK_MARKER_ALT not in _dsml_only)
+check("#120b _dsml_residue_present 认出纯 DSML 令牌",
+      P._dsml_residue_present(_dsml_only) is True)
+_out4, _err4 = _run([
+    _frame({"role": "assistant", "content": _dsml_only}),
+    _frame({}, "stop"),
+])
+check("#120b 纯 DSML 残片在 tools 会话里 fail-closed（不再补发）",
+      isinstance(_err4, P.EmptyToolEcho), type(_err4).__name__ if _err4 else None)
+check("#120b 错误帧 detail 是 unrecovered_*",
+      _err4 is not None and "unrecovered_" in getattr(_err4, "detail", ""),
+      getattr(_err4, "detail", None) if _err4 else None)
+check("#120b 已发出的正文里不得出现 DSML 令牌",
+      "DSML" not in b"".join(_out4).decode("utf-8", "replace"))
+
+# 反向：散文里只是「提到 DSML 这个词」不算残片
+check("#120b 散文提到 DSML 但不含令牌 -> 不判残片",
+      P._dsml_residue_present("这一轮我们讨论的是 DSML 协议为什么会漏。") is False)
+_out5, _err5 = _run([
+    _frame({"role": "assistant", "content": "这一轮讨论的是 DSML 协议为什么会漏。"}),
+    _frame({}, "stop"),
+])
+check("#120b 提到 DSML 的散文照旧透传（不误伤）",
+      _err5 is None and "DSML" in b"".join(_out5).decode("utf-8", "replace"),
+      type(_err5).__name__ if _err5 else None)
+
 finish()
